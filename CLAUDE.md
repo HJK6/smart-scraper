@@ -8,8 +8,7 @@ This package provides two web scraping tools powered by Claude AI and undetected
 # Install dependencies
 pip install -r requirements.txt
 
-# Set your Anthropic API key
-export ANTHROPIC_API_KEY=sk-ant-...
+# Requires `claude` CLI in PATH (uses Max subscription, no API key needed)
 
 # Run a scrape
 python modules/smart_crawler.py "https://example.com" "Find the main heading"
@@ -19,9 +18,8 @@ python modules/smart_crawler.py "https://example.com" "Find the main heading"
 
 1. **Python 3.9+**
 2. **Google Chrome** installed on the system
-3. **Anthropic API key** — set as `ANTHROPIC_API_KEY` environment variable
+3. **Claude CLI** — `claude` must be in PATH (uses Max subscription, no API key needed)
 4. **Python packages** — install via `pip install -r requirements.txt`:
-   - `anthropic` — Claude AI client
    - `selenium` — browser automation
    - `undetected-chromedriver` — bot-detection bypass for Chrome
    - `beautifulsoup4` + `lxml` + `html5lib` — HTML parsing

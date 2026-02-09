@@ -23,7 +23,6 @@ import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
-import anthropic
 from bs4 import BeautifulSoup
 from selenium.common.exceptions import (
     ElementClickInterceptedException,
@@ -39,7 +38,7 @@ from models import (
     ScraperStep,
     SmartCrawlResult,
 )
-from modules.web_scraper import WebScraper, clean_html_for_ai, SYSTEM_PROMPT
+from modules.web_scraper import WebScraper, clean_html_for_ai, call_claude_cli, SYSTEM_PROMPT
 from modules.driver_manager import DriverManager
 
 logger = logging.getLogger(__name__)
@@ -92,13 +91,10 @@ class SmartCrawler:
         headless: bool = True,
         chrome_version_main: int = 144,
         max_steps: int = 25,
-        model: str = "claude-opus-4-20250514",
     ):
         self.headless = headless
         self.chrome_version_main = chrome_version_main
         self.max_steps = max_steps
-        self.model = model
-        self.client = anthropic.Anthropic()
         self.dm: Optional[DriverManager] = None
         self.steps: list[ScraperStep] = []
 
@@ -357,30 +353,25 @@ class SmartCrawler:
         return f"CURRENT URL: {url}\n\n{cleaned}"
 
     def _ask_ai(self, goal: str, page_context: str, history: list[ScraperStep]) -> ScraperAction:
-        """Send page context to AI and get next action."""
-        messages = []
+        """Send page context to Claude CLI and get next action."""
+        prompt_parts = []
         if history:
-            history_text = "Previous actions this session:\n"
+            prompt_parts.append("Previous actions this session:")
             for i, step in enumerate(history[-10:], 1):
-                history_text += f"  {i}. {step.action} — {step.reason or ''}\n"
+                prompt_parts.append(f"  {i}. {step.action} — {step.reason or ''}")
                 if step.error:
-                    history_text += f"     ERROR: {step.error}\n"
-            messages.append({"role": "user", "content": history_text})
-            messages.append({"role": "assistant", "content": "Understood. I'll take that history into account."})
+                    prompt_parts.append(f"     ERROR: {step.error}")
+            prompt_parts.append("")
 
-        messages.append({
-            "role": "user",
-            "content": f"GOAL: {goal}\n\n{page_context}\n\nWhat is the next action?",
-        })
+        prompt_parts.append(f"GOAL: {goal}")
+        prompt_parts.append("")
+        prompt_parts.append(page_context)
+        prompt_parts.append("")
+        prompt_parts.append("What is the next action?")
 
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=messages,
-        )
+        user_prompt = "\n".join(prompt_parts)
+        text = call_claude_cli(SYSTEM_PROMPT, user_prompt)
 
-        text = response.content[0].text.strip()
         json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
         if json_match:
             text = json_match.group(1)
@@ -550,14 +541,7 @@ class SmartCrawler:
             session_desc += f"{err}\n"
 
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=4096,
-                system=RECIPE_GEN_PROMPT,
-                messages=[{"role": "user", "content": session_desc}],
-            )
-
-            text = response.content[0].text.strip()
+            text = call_claude_cli(RECIPE_GEN_PROMPT, session_desc)
 
             json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
             if json_match:

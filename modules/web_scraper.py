@@ -15,7 +15,7 @@ import time
 import logging
 from typing import Optional
 
-import anthropic
+import subprocess
 from bs4 import BeautifulSoup, Comment
 from selenium.common.exceptions import (
     NoSuchElementException,
@@ -28,6 +28,20 @@ from models import ScraperAction, ScraperStep, ScrapeResult
 from modules.driver_manager import DriverManager
 
 logger = logging.getLogger(__name__)
+
+
+def call_claude_cli(system_prompt: str, user_prompt: str) -> str:
+    """Call Claude via CLI (uses Max subscription, no API key needed)."""
+    combined = f"<instructions>\n{system_prompt}\n</instructions>\n\n{user_prompt}"
+    proc = subprocess.run(
+        ["claude", "-p", "--output-format", "text"],
+        input=combined,
+        capture_output=True, text=True, timeout=300,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"Claude CLI error (rc={proc.returncode}): {proc.stderr[:500]}")
+    return proc.stdout.strip()
+
 
 SYSTEM_PROMPT = """\
 You are a web navigation AI. You are given a user's goal and the current page content.
@@ -150,7 +164,6 @@ class WebScraper:
         headless: Run Chrome without GUI (default: True)
         chrome_version_main: Major Chrome version (default: 144)
         max_steps: Maximum AI decision steps (default: 20)
-        model: Anthropic model to use (default: claude-opus-4-20250514)
     """
 
     def __init__(
@@ -158,13 +171,10 @@ class WebScraper:
         headless: bool = True,
         chrome_version_main: int = 144,
         max_steps: int = 20,
-        model: str = "claude-opus-4-20250514",
     ):
         self.headless = headless
         self.chrome_version_main = chrome_version_main
         self.max_steps = max_steps
-        self.model = model
-        self.client = anthropic.Anthropic()
         self.dm: Optional[DriverManager] = None
         self.steps: list[ScraperStep] = []
 
@@ -207,31 +217,25 @@ class WebScraper:
         return f"CURRENT URL: {url}\n\n{cleaned}"
 
     def _ask_ai(self, goal: str, page_context: str, history: list[ScraperStep]) -> ScraperAction:
-        """Send page context to AI and get next action."""
-        messages = []
+        """Send page context to Claude CLI and get next action."""
+        prompt_parts = []
 
         if history:
-            history_text = "Previous actions this session:\n"
+            prompt_parts.append("Previous actions this session:")
             for i, step in enumerate(history[-10:], 1):
-                history_text += f"  {i}. {step.action} — {step.reason or ''}\n"
+                prompt_parts.append(f"  {i}. {step.action} — {step.reason or ''}")
                 if step.error:
-                    history_text += f"     ERROR: {step.error}\n"
-            messages.append({"role": "user", "content": history_text})
-            messages.append({"role": "assistant", "content": "Understood. I'll take that history into account."})
+                    prompt_parts.append(f"     ERROR: {step.error}")
+            prompt_parts.append("")
 
-        messages.append({
-            "role": "user",
-            "content": f"GOAL: {goal}\n\n{page_context}\n\nWhat is the next action?",
-        })
+        prompt_parts.append(f"GOAL: {goal}")
+        prompt_parts.append("")
+        prompt_parts.append(page_context)
+        prompt_parts.append("")
+        prompt_parts.append("What is the next action?")
 
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=messages,
-        )
-
-        text = response.content[0].text.strip()
+        user_prompt = "\n".join(prompt_parts)
+        text = call_claude_cli(SYSTEM_PROMPT, user_prompt)
 
         json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
         if json_match:
