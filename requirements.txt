@@ -1,0 +1,8 @@
+anthropic
+selenium
+undetected-chromedriver
+beautifulsoup4
+lxml
+html5lib
+certifi
+urllib3
