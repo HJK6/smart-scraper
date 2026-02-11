@@ -13,10 +13,9 @@ AI-powered web scraping toolkit using Claude and undetected Chrome. Tell it what
 
 ```bash
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-Requires **Google Chrome** installed on the system.
+Requires **Google Chrome** installed and the **Claude CLI** (`claude`) in PATH. Uses your Claude Max subscription — no API key needed.
 
 ## Usage
 
