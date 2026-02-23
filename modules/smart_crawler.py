@@ -3,8 +3,8 @@ Smart Crawler — Self-learning web crawler that builds deterministic recipes fr
 
 Flow:
 1. Check if a recipe exists for the (domain, goal) pair
-2. If YES -> Execute recipe deterministically. On failure, fall back to AI.
-3. If NO -> Run AI-guided crawl (like web_scraper.py), record every step,
+2. If YES → Execute recipe deterministically. On failure, fall back to AI.
+3. If NO → Run AI-guided crawl (like web_scraper.py), record every step,
    then generate a deterministic recipe from the successful run.
 
 Recipes are saved as JSON in the recipes/ directory and can be reused
@@ -33,12 +33,13 @@ from selenium.common.exceptions import (
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import (
     CrawlerRecipe,
+    DiscoveredApi,
     RecipeStep,
     ScraperAction,
     ScraperStep,
     SmartCrawlResult,
 )
-from modules.web_scraper import WebScraper, clean_html_for_ai, call_claude_cli, SYSTEM_PROMPT
+from modules.web_scraper import WebScraper, clean_html_for_ai, call_claude_cli, analyze_network_for_apis
 from modules.driver_manager import DriverManager
 
 logger = logging.getLogger(__name__)
@@ -71,7 +72,7 @@ The recipe must be a JSON object with this structure:
 Rules:
 - Use robust CSS selectors (prefer IDs > data attributes > classes > tag+text combos)
 - Include fallback_selectors where possible (2-3 alternatives)
-- Skip scroll/wait steps that were just exploratory -- only keep essential ones
+- Skip scroll/wait steps that were just exploratory — only keep essential ones
 - For type actions with dynamic values, use {variable} placeholders
 - For extraction, map field names to CSS selectors that locate the data
 - Mark truly optional steps with "optional": true
@@ -152,6 +153,7 @@ class SmartCrawler:
                     chrome_version_main=self.chrome_version_main,
                 )
                 self.dm.get("about:blank")
+                self.dm.enable_network_logging()
                 logger.info("Headless Chrome started.")
                 return
             except Exception as e:
@@ -167,11 +169,20 @@ class SmartCrawler:
             undetected=True, headless=False,
             chrome_version_main=self.chrome_version_main,
         )
+        self.dm.enable_network_logging()
 
     def close(self):
         if self.dm:
             self.dm.close()
             self.dm = None
+
+    def _discover_apis(self) -> list:
+        """Run network traffic analysis to find API endpoints."""
+        try:
+            return analyze_network_for_apis(self.dm)
+        except Exception as e:
+            logger.warning(f"API discovery failed: {e}")
+            return []
 
     # ------------------------------------------------------------------
     # Deterministic recipe execution
@@ -313,6 +324,7 @@ class SmartCrawler:
             if recipe.extract_fields:
                 data = self._extract_data(recipe.extract_fields)
 
+            # Also check last step for extract_fields
             for step in recipe.steps:
                 if step.extract_fields:
                     data.update(self._extract_data(step.extract_fields))
@@ -323,6 +335,7 @@ class SmartCrawler:
             recipe.last_used = int(time.time())
             self._save_recipe(recipe)
 
+            apis = self._discover_apis()
             return SmartCrawlResult(
                 success=True,
                 data=data if data else None,
@@ -330,20 +343,23 @@ class SmartCrawler:
                 steps=self.steps,
                 used_recipe=True,
                 recipe_id=recipe.recipe_id,
+                discovered_apis=apis,
             )
 
         except Exception as e:
             logger.exception("Recipe execution failed")
+            apis = self._discover_apis()
             return SmartCrawlResult(
                 success=False,
                 error=str(e),
                 steps=self.steps,
                 used_recipe=True,
                 recipe_id=recipe.recipe_id,
+                discovered_apis=apis,
             )
 
     # ------------------------------------------------------------------
-    # AI-guided crawl
+    # AI-guided crawl (same as web_scraper but records for recipe gen)
     # ------------------------------------------------------------------
 
     def _get_page_context(self) -> str:
@@ -354,6 +370,8 @@ class SmartCrawler:
 
     def _ask_ai(self, goal: str, page_context: str, history: list[ScraperStep]) -> ScraperAction:
         """Send page context to Claude CLI and get next action."""
+        from modules.web_scraper import SYSTEM_PROMPT
+
         prompt_parts = []
         if history:
             prompt_parts.append("Previous actions this session:")
@@ -478,20 +496,24 @@ class SmartCrawler:
 
                 if action.action == "done":
                     self.steps.append(step)
+                    apis = self._discover_apis()
                     return SmartCrawlResult(
                         success=True,
                         result=action.result,
                         data=action.data,
                         steps=self.steps,
+                        discovered_apis=apis,
                     )
 
                 if action.action == "fail":
                     step.error = action.reason
                     self.steps.append(step)
+                    apis = self._discover_apis()
                     return SmartCrawlResult(
                         success=False,
                         error=action.reason,
                         steps=self.steps,
+                        discovered_apis=apis,
                     )
 
                 if action.action == "extract":
@@ -505,15 +527,18 @@ class SmartCrawler:
                 if error:
                     logger.warning(f"    Action error: {error}")
 
+            apis = self._discover_apis()
             return SmartCrawlResult(
                 success=False,
                 error=f"Reached max steps ({self.max_steps})",
                 steps=self.steps,
+                discovered_apis=apis,
             )
 
         except Exception as e:
             logger.exception("AI crawl failed")
-            return SmartCrawlResult(success=False, error=str(e), steps=self.steps)
+            apis = self._discover_apis()
+            return SmartCrawlResult(success=False, error=str(e), steps=self.steps, discovered_apis=apis)
 
     # ------------------------------------------------------------------
     # Recipe generation from AI crawl
@@ -523,6 +548,7 @@ class SmartCrawler:
         """Use AI to generate a deterministic recipe from a successful crawl session."""
         domain = urlparse(start_url).netloc
 
+        # Build session description for AI
         session_desc = f"GOAL: {goal}\nSTART URL: {start_url}\nDOMAIN: {domain}\n\n"
         session_desc += "SUCCESSFUL CRAWL STEPS:\n"
         for s in steps:
@@ -543,6 +569,7 @@ class SmartCrawler:
         try:
             text = call_claude_cli(RECIPE_GEN_PROMPT, session_desc)
 
+            # Parse JSON
             json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
             if json_match:
                 text = json_match.group(1)
@@ -562,6 +589,7 @@ class SmartCrawler:
                 logger.error(f"Recipe generation returned invalid JSON: {text[:300]}")
                 return None
 
+            # Build recipe object
             recipe_steps = []
             for s in raw.get("steps", []):
                 recipe_steps.append(RecipeStep(
@@ -625,6 +653,7 @@ class SmartCrawler:
         """
         domain = urlparse(start_url).netloc
 
+        # Step 1: Try recipe first (unless forced AI)
         if not force_ai:
             recipe = self._load_recipe(domain, goal)
             if recipe:
@@ -634,17 +663,21 @@ class SmartCrawler:
                 if result.success:
                     return result
 
+                # Recipe failed — fall back to AI
                 logger.warning(f"Recipe failed: {result.error} — falling back to AI")
                 recipe.times_used += 1
                 recipe.ai_fallback_count += 1
                 recipe.last_used = int(time.time())
                 self._save_recipe(recipe)
 
+                # Close and re-init browser for clean AI run
                 self.close()
 
+        # Step 2: AI-guided crawl
         result = self._run_ai_crawl(goal, start_url)
 
         if result.success:
+            # Step 3: Generate recipe from successful crawl
             logger.info("AI crawl succeeded — generating recipe...")
             recipe = self._generate_recipe(goal, start_url, result.steps)
             if recipe:
@@ -753,3 +786,20 @@ if __name__ == "__main__":
     for step in result.steps:
         err = f" [ERROR: {step.error}]" if step.error else ""
         print(f"  {step.step}. {step.action} — {step.reason or ''}{err}")
+
+    if result.discovered_apis:
+        print(f"\n{'=' * 60}")
+        print(f"DISCOVERED API ENDPOINTS ({len(result.discovered_apis)}):")
+        for i, api in enumerate(result.discovered_apis, 1):
+            auth = (
+                "NO AUTH" if api.works_without_auth
+                else "COOKIES" if api.works_with_cookies
+                else "AUTH REQUIRED"
+            )
+            print(f"\n  {i}. [{auth}] {api.method} {api.url}")
+            print(f"     Content-Type: {api.content_type}")
+            if api.response_preview:
+                preview = api.response_preview[:200].replace("\n", " ")
+                print(f"     Preview: {preview}")
+            if api.notes:
+                print(f"     Notes: {api.notes}")

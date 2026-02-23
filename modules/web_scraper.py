@@ -1,7 +1,7 @@
 """
-AI Web Scraper — Uses undetected Chrome + Claude to intelligently navigate websites.
+AI Web Scraper — Uses undetected Chrome + Claude Opus to intelligently navigate websites.
 
-On each page, the AI analyzes the content and decides the next action:
+On each page, Opus analyzes the content and decides the next action:
 click a link, fill a form, extract data, scroll, or declare the task complete.
 """
 
@@ -24,7 +24,7 @@ from selenium.common.exceptions import (
 )
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from models import ScraperAction, ScraperStep, ScrapeResult
+from models import ScraperAction, ScraperStep, ScrapeResult, DiscoveredApi
 from modules.driver_manager import DriverManager
 
 logger = logging.getLogger(__name__)
@@ -147,6 +147,7 @@ def clean_html_for_ai(html: str, max_length: int = 50000) -> str:
     main = soup.find("main") or soup.find("article") or soup.find(id="content") or soup.find("body")
     if main:
         text = main.get_text(separator="\n", strip=True)
+        # Collapse whitespace
         text = re.sub(r"\n{3,}", "\n\n", text)
         lines.append(f"\nPAGE TEXT:\n{text}")
 
@@ -154,6 +155,152 @@ def clean_html_for_ai(html: str, max_length: int = 50000) -> str:
     if len(output) > max_length:
         output = output[:max_length] + "\n... [TRUNCATED]"
     return output
+
+
+def analyze_network_for_apis(dm) -> list:
+    """Analyze network traffic captured during a scrape to discover API endpoints.
+
+    Filters for XHR/Fetch/JSON responses, tries to get response bodies,
+    then tests each endpoint to see if it works without auth or with cookies.
+
+    Args:
+        dm: DriverManager instance with accumulated performance logs.
+
+    Returns:
+        List of DiscoveredApi objects.
+    """
+    from urllib.parse import urlparse
+
+    traffic = dm.get_network_traffic()
+    if not traffic:
+        return []
+
+    browser_cookies = dm.get_browser_cookies()
+
+    skip_extensions = {
+        ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+        ".woff", ".woff2", ".ttf", ".ico", ".map", ".webp", ".mp4",
+        ".mp3", ".webm", ".avif",
+    }
+
+    api_candidates = []
+    for entry in traffic:
+        resp = entry.get("response")
+        if not resp:
+            continue
+
+        url = entry["url"]
+        if url.startswith("data:") or url.startswith("chrome-extension:"):
+            continue
+
+        parsed = urlparse(url)
+        path_lower = parsed.path.lower()
+        ext = os.path.splitext(path_lower)[1]
+        if ext in skip_extensions:
+            continue
+
+        mime = resp.get("mimeType", "").lower()
+        resource_type = entry.get("resourceType", "").lower()
+        status = resp.get("status", 0)
+
+        is_api = (
+            "json" in mime
+            or resource_type in ("xhr", "fetch")
+            or "/api/" in path_lower
+            or "/graphql" in path_lower
+            or "/rest/" in path_lower
+        )
+
+        if is_api and 200 <= status < 400:
+            body = dm.get_response_body(entry["requestId"])
+            api_candidates.append({"entry": entry, "resp": resp, "body": body})
+
+    if not api_candidates:
+        return []
+
+    # Dedupe by URL path, keep first 15
+    seen_paths = set()
+    unique = []
+    for c in api_candidates:
+        path = urlparse(c["entry"]["url"]).path
+        if path not in seen_paths:
+            seen_paths.add(path)
+            unique.append(c)
+    api_candidates = unique[:15]
+
+    # Test each endpoint
+    discovered = []
+    for candidate in api_candidates:
+        entry = candidate["entry"]
+        url = entry["url"]
+        method = entry["method"]
+        body_preview = candidate["body"]
+
+        api = DiscoveredApi(
+            url=url,
+            method=method,
+            content_type=candidate["resp"].get("mimeType", ""),
+            status_code=candidate["resp"].get("status", 0),
+            response_preview=body_preview[:2000] if body_preview else None,
+        )
+
+        if method.upper() == "GET":
+            ua = entry.get("headers", {}).get(
+                "User-Agent",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+            )
+            # Test without auth
+            try:
+                import requests as http_requests
+
+                r = http_requests.get(url, timeout=5, headers={"User-Agent": ua})
+                if r.status_code == 200 and len(r.text) > 10:
+                    api.works_without_auth = True
+                    api.notes = "No auth needed"
+            except Exception:
+                pass
+
+            # Test with cookies if no-auth failed
+            if not api.works_without_auth and browser_cookies:
+                try:
+                    import requests as http_requests
+
+                    r = http_requests.get(
+                        url, timeout=5, cookies=browser_cookies, headers={"User-Agent": ua}
+                    )
+                    if r.status_code == 200 and len(r.text) > 10:
+                        api.works_with_cookies = True
+                        api.cookies_needed = list(browser_cookies.keys())
+                        api.notes = "Works with browser cookies"
+                except Exception:
+                    pass
+
+            if not api.works_without_auth and not api.works_with_cookies:
+                api.notes = "Requires auth — could not call directly"
+
+        elif method.upper() == "POST":
+            # Record POST details for manual testing
+            req_headers = entry.get("headers", {})
+            api.request_headers = {
+                k: v for k, v in req_headers.items()
+                if k.lower() in ("content-type", "accept", "authorization", "x-csrf-token")
+            }
+            api.post_data = entry.get("postData")
+            api.notes = "POST — saved headers/body for manual testing"
+
+        discovered.append(api)
+
+    logger.info(f"Discovered {len(discovered)} API endpoints from network traffic")
+    for api in discovered:
+        auth_status = (
+            "NO AUTH" if api.works_without_auth
+            else "COOKIES" if api.works_with_cookies
+            else "AUTH REQUIRED"
+        )
+        logger.info(f"  {api.method} {api.url[:80]} [{auth_status}]")
+
+    return discovered
 
 
 class WebScraper:
@@ -191,7 +338,9 @@ class WebScraper:
                     headless=True,
                     chrome_version_main=self.chrome_version_main,
                 )
+                # Quick test — navigate to a blank page
                 self.dm.get("about:blank")
+                self.dm.enable_network_logging()
                 logger.info("Headless Chrome started successfully.")
                 return
             except Exception as e:
@@ -208,6 +357,7 @@ class WebScraper:
             headless=False,
             chrome_version_main=self.chrome_version_main,
         )
+        self.dm.enable_network_logging()
 
     def _get_page_context(self) -> str:
         """Get current page state for AI."""
@@ -220,6 +370,7 @@ class WebScraper:
         """Send page context to Claude CLI and get next action."""
         prompt_parts = []
 
+        # Include action history so AI knows what it already tried
         if history:
             prompt_parts.append("Previous actions this session:")
             for i, step in enumerate(history[-10:], 1):
@@ -237,6 +388,8 @@ class WebScraper:
         user_prompt = "\n".join(prompt_parts)
         text = call_claude_cli(SYSTEM_PROMPT, user_prompt)
 
+        # Try to extract JSON from the response
+        # Handle cases where AI wraps JSON in markdown code blocks
         json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
         if json_match:
             text = json_match.group(1)
@@ -296,7 +449,7 @@ class WebScraper:
                 time.sleep(action.seconds or 2)
 
             elif action.action in ("extract", "done", "fail"):
-                pass
+                pass  # Handled by caller
 
             else:
                 return f"Unknown action: {action.action}"
@@ -312,12 +465,20 @@ class WebScraper:
 
         return None
 
+    def _discover_apis(self) -> list:
+        """Run network traffic analysis to find API endpoints."""
+        try:
+            return analyze_network_for_apis(self.dm)
+        except Exception as e:
+            logger.warning(f"API discovery failed: {e}")
+            return []
+
     def scrape(self, goal: str, start_url: str) -> ScrapeResult:
         """
         Navigate the web to accomplish a goal.
 
         Args:
-            goal: What to find/do (e.g. "Find the price of iPhone 17 Pro")
+            goal: What to find/do (e.g. "Find the price of iPhone 16 on Apple's website")
             start_url: Starting URL to navigate to
 
         Returns:
@@ -339,6 +500,7 @@ class WebScraper:
                 error=error,
             )
 
+        result = None
         try:
             logger.info(f"Starting scrape: {goal}")
             logger.info(f"Navigating to: {start_url}")
@@ -353,46 +515,56 @@ class WebScraper:
 
                 logger.info(f"  AI decided: {action.action} — {action.reason or ''}")
 
+                # Terminal actions
                 if action.action == "done":
                     self.steps.append(_make_step(step_num, action))
-                    return ScrapeResult(
+                    result = ScrapeResult(
                         success=True,
                         result=action.result,
                         data=action.data,
                         steps=self.steps,
                     )
+                    break
 
                 if action.action == "fail":
                     self.steps.append(_make_step(step_num, action, error=action.reason))
-                    return ScrapeResult(
+                    result = ScrapeResult(
                         success=False,
                         error=action.reason,
                         steps=self.steps,
                     )
+                    break
 
                 if action.action == "extract":
                     self.steps.append(_make_step(step_num, action))
                     continue
 
+                # Execute browser action
                 error = self._execute_action(action)
                 self.steps.append(_make_step(step_num, action, error=error))
 
                 if error:
                     logger.warning(f"  Action error: {error}")
 
-            return ScrapeResult(
-                success=False,
-                error=f"Reached max steps ({self.max_steps}) without completing goal",
-                steps=self.steps,
-            )
+            # Max steps reached (only if we didn't break out)
+            if result is None:
+                result = ScrapeResult(
+                    success=False,
+                    error=f"Reached max steps ({self.max_steps}) without completing goal",
+                    steps=self.steps,
+                )
 
         except Exception as e:
             logger.exception("Scrape failed with exception")
-            return ScrapeResult(
+            result = ScrapeResult(
                 success=False,
                 error=str(e),
                 steps=self.steps,
             )
+
+        # Discover API endpoints from network traffic
+        result.discovered_apis = self._discover_apis()
+        return result
 
     def close(self):
         if self.dm:
@@ -440,3 +612,20 @@ if __name__ == "__main__":
     for step in result.steps:
         err = f" [ERROR: {step.error}]" if step.error else ""
         print(f"  {step.step}. {step.action} — {step.reason or ''}{err}")
+
+    if result.discovered_apis:
+        print(f"\n{'=' * 60}")
+        print(f"DISCOVERED API ENDPOINTS ({len(result.discovered_apis)}):")
+        for i, api in enumerate(result.discovered_apis, 1):
+            auth = (
+                "NO AUTH" if api.works_without_auth
+                else "COOKIES" if api.works_with_cookies
+                else "AUTH REQUIRED"
+            )
+            print(f"\n  {i}. [{auth}] {api.method} {api.url}")
+            print(f"     Content-Type: {api.content_type}")
+            if api.response_preview:
+                preview = api.response_preview[:200].replace("\n", " ")
+                print(f"     Preview: {preview}")
+            if api.notes:
+                print(f"     Notes: {api.notes}")

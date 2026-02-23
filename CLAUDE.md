@@ -1,6 +1,6 @@
 # Smart Scraper — AI-Powered Web Scraping Toolkit
 
-This package provides two web scraping tools powered by Claude AI and undetected Chrome.
+This package provides three layers of web scraping powered by Claude AI and undetected Chrome.
 
 ## Quick Start
 
@@ -24,6 +24,7 @@ python modules/smart_crawler.py "https://example.com" "Find the main heading"
    - `undetected-chromedriver` — bot-detection bypass for Chrome
    - `beautifulsoup4` + `lxml` + `html5lib` — HTML parsing
    - `certifi` + `urllib3` — HTTP utilities
+   - `requests` — API endpoint testing
 
 ### macOS ARM64 (Apple Silicon) Notes
 
@@ -74,7 +75,7 @@ dm = DriverManager(undetected=True, headless=True)
 dm = DriverManager(undetected=True, headless=False)
 
 # Standard Chrome (no bot-detection bypass)
-dm = DriverManager(headless=True)
+dm = DriverManager(undetected=False, headless=True)
 ```
 
 **Key methods:**
@@ -94,17 +95,39 @@ dm = DriverManager(headless=True)
 | `dm.wait_on_element_load(xpath, timeout)` | Wait for element to appear |
 | `dm.switch_to_iframe(iframe)` | Switch to iframe context |
 | `dm.switch_to_main()` | Switch back to main document |
-| `dm.enable_network_logging()` | Start capturing network requests |
-| `dm.get_network_requests()` | Get captured network requests |
+| `dm.execute_postback(target, argument)` | Execute ASP.NET postback |
+| `dm.select_by_value(element_id, value)` | Select dropdown option by value |
 | `dm.close()` | Quit the browser |
 
-**Important:** Always use `undetected=True` when scraping real websites. Standard Chrome gets detected and blocked by most sites.
+**Network logging methods:**
+| Method | Description |
+|--------|-------------|
+| `dm.enable_network_logging()` | Start capturing network requests |
+| `dm.get_network_requests()` | Get captured network requests |
+| `dm.get_network_requests(only_xhr=True)` | Get only XHR/Fetch requests |
+| `dm.get_network_requests_by_url(partial)` | Filter requests by URL substring |
+| `dm.get_network_requests_by_method(method)` | Filter requests by HTTP method |
+| `dm.get_network_requests_by_url_and_method(url, method)` | Filter by both |
+| `dm.get_network_traffic()` | Get full request+response pairs (status, headers, mimeType) |
+| `dm.get_response_body(requestId)` | Get response body for a specific request |
+| `dm.get_browser_cookies()` | Get all browser cookies as dict |
+| `dm.clear_network_logs()` | Clear captured logs |
+
+**Quick page exploration:**
+```python
+from modules.driver_manager import explore_page
+
+explore_page("https://example.com")
+# Saves network requests + HTML to debug/web-manager-explorer/
+```
+
+**Important:** Always use `undetected=True` when scraping real websites. Standard Chrome gets detected and blocked by most sites. In headless mode, the UA string is overridden to remove "HeadlessChrome" which Cloudflare would otherwise reject.
 
 ---
 
 ### 2. WebScraper (`modules/web_scraper.py`)
 
-AI-powered single-run scraper. Claude AI analyzes each page and decides what to do next.
+AI-powered single-run scraper. Claude AI analyzes each page and decides what to do next. Automatically discovers API endpoints from network traffic.
 
 ```python
 from modules.web_scraper import run_scraper
@@ -119,6 +142,10 @@ result = run_scraper(
 if result.success:
     print(result.result)  # "The iPhone 17 Pro starts at $1099"
     print(result.data)    # {"product": "iPhone 17 Pro", "price": "$1099"}
+
+# Check discovered API endpoints
+for api in result.discovered_apis:
+    print(f"{api.method} {api.url} — auth: {api.works_without_auth}")
 ```
 
 **CLI:**
@@ -130,9 +157,11 @@ python modules/web_scraper.py "https://example.com" "Find pricing" --max-steps 3
 
 **How it works:**
 1. Opens Chrome and navigates to `start_url`
-2. Cleans HTML and sends page context to Claude
-3. Claude returns a JSON action: click, type, scroll, goto, extract, done, or fail
-4. Executes the action, then repeats until `done` or max steps reached
+2. Enables network logging to capture API traffic
+3. Cleans HTML and sends page context to Claude
+4. Claude returns a JSON action: click, type, scroll, goto, extract, done, or fail
+5. Executes the action, then repeats until `done` or max steps reached
+6. Analyzes network traffic to discover API endpoints
 
 **Supported AI actions:**
 | Action | Description |
@@ -205,6 +234,23 @@ result = smart_crawl(
 
 ---
 
+## API Discovery
+
+Both WebScraper and SmartCrawler automatically monitor network traffic during scrapes. After each scrape, they:
+1. Filter for XHR/Fetch/JSON API responses
+2. Attempt to call each endpoint without auth (plain GET)
+3. If that fails, retry with browser cookies
+4. Return `discovered_apis` in the result (list of `DiscoveredApi` objects)
+
+```python
+result = smart_crawl(goal="...", start_url="...")
+for api in result.discovered_apis:
+    print(api.url, api.method, api.works_without_auth, api.works_with_cookies)
+    print(api.response_preview)  # first 2000 chars of response
+```
+
+---
+
 ## Data Models (`models.py`)
 
 All models extend `DataclassBase` which provides `from_dict()`, `to_dict()`, `from_json()`, `to_json()`.
@@ -213,10 +259,11 @@ All models extend `DataclassBase` which provides `from_dict()`, `to_dict()`, `fr
 |-------|---------|
 | `ScraperAction` | AI decision: action, selector, text, url, data, result, reason |
 | `ScraperStep` | Recorded step: step#, url, action, selector, error |
-| `ScrapeResult` | WebScraper result: success, result, data, steps, error |
+| `ScrapeResult` | WebScraper result: success, result, data, steps, error, discovered_apis |
+| `DiscoveredApi` | API endpoint: url, method, auth status, response preview |
 | `RecipeStep` | Single recipe step with fallback selectors |
 | `CrawlerRecipe` | Full recipe: id, domain, goal, steps, stats |
-| `SmartCrawlResult` | SmartCrawler result: extends ScrapeResult + recipe info |
+| `SmartCrawlResult` | SmartCrawler result: extends ScrapeResult + recipe info + discovered_apis |
 
 ---
 
@@ -228,6 +275,7 @@ All models extend `DataclassBase` which provides `from_dict()`, `to_dict()`, `fr
 | Speed | Slower | Fast after first run |
 | Learning | No | Yes (generates recipes) |
 | Cost | Higher | Much lower after first run |
+| API discovery | Yes | Yes |
 | Use case | One-off scrapes | Repeated scrapes |
 
 **Recommendation:** Use `SmartCrawler` by default. It gives you the best of both worlds.

@@ -127,6 +127,23 @@ class ScraperStep(DataclassBase):
 
 
 @dataclass
+class DiscoveredApi(DataclassBase):
+    """An API endpoint discovered from network traffic during a scrape."""
+
+    url: str = ""
+    method: str = "GET"
+    content_type: str = ""
+    status_code: int = 0
+    response_preview: Optional[str] = None
+    works_without_auth: bool = False
+    works_with_cookies: bool = False
+    cookies_needed: Optional[List[str]] = None
+    request_headers: Optional[Dict[str, str]] = None
+    post_data: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@dataclass
 class ScrapeResult(DataclassBase):
     """Final result of an AI-powered scrape session."""
 
@@ -135,6 +152,7 @@ class ScrapeResult(DataclassBase):
     result: Optional[str] = None
     steps: List[ScraperStep] = field(default_factory=list)
     error: Optional[str] = None
+    discovered_apis: List[DiscoveredApi] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -189,3 +207,4 @@ class SmartCrawlResult(DataclassBase):
     recipe_id: Optional[str] = None
     ai_fallback_used: bool = False  # True if AI had to take over mid-recipe
     recipe_generated: bool = False  # True if a new recipe was created from this run
+    discovered_apis: List[DiscoveredApi] = field(default_factory=list)

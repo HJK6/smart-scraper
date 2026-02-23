@@ -9,7 +9,7 @@ Usage:
     dm = DriverManager(undetected=True, headless=True)
 
     # Standard Chrome
-    dm = DriverManager(headless=True)
+    dm = DriverManager(undetected=False, headless=True)
 
     dm.get("https://example.com")
     element = dm.find_element_by_xpath("//h1")
@@ -29,10 +29,8 @@ from bs4 import BeautifulSoup
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import NoSuchElementException
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import Select
 
 
@@ -75,16 +73,16 @@ class DriverManager:
 
     Args:
         view: "desktop" or "mobile" (default: "desktop")
-        headless: Run browser without GUI (default: False)
-        undetected: Use undetected-chromedriver to bypass bot detection (default: False)
+        headless: Run browser without GUI (default: True)
+        undetected: Use undetected-chromedriver to bypass bot detection (default: True)
         chrome_version_main: Major Chrome version number (default: 144)
     """
 
     def __init__(self, **kwargs):
         self.view = kwargs.get("view", "desktop")
-        self.headless = kwargs.get("headless", False)
+        self.headless = kwargs.get("headless", True)
         self.storage_path = "./out.txt"
-        self.undetected = kwargs.get("undetected", False)
+        self.undetected = kwargs.get("undetected", True)
         self.chrome_version_main = kwargs.get("chrome_version_main", 144)
         self.refresh()
 
@@ -170,6 +168,13 @@ class DriverManager:
         element.click()
 
     def execute_postback(self, target, argument):
+        """
+        Execute ASP.NET postback in a way that avoids strict mode restrictions.
+
+        Args:
+            target: The postback target (e.g., 'm_DisplayCore')
+            argument: The postback argument (e.g., 'DisplayInternalAction|TabSwitch|98|PARCELMAP')
+        """
         script = f"""
         setTimeout(function() {{
             try {{
@@ -183,6 +188,68 @@ class DriverManager:
 
     def enable_network_logging(self):
         self.driver.execute_cdp_cmd("Network.enable", {})
+
+    def get_network_traffic(self):
+        """Get network request+response pairs with full details (status, headers, mimeType, resourceType)."""
+        try:
+            logs = self.driver.get_log("performance")
+            requests = {}
+            responses = {}
+
+            for entry in logs:
+                message = json.loads(entry["message"])["message"]
+                method = message["method"]
+                params = message.get("params", {})
+
+                if method == "Network.requestWillBeSent":
+                    req_id = params.get("requestId")
+                    req = params.get("request", {})
+                    requests[req_id] = {
+                        "requestId": req_id,
+                        "url": req.get("url", ""),
+                        "method": req.get("method", ""),
+                        "headers": req.get("headers", {}),
+                        "postData": req.get("postData"),
+                        "resourceType": params.get("type", ""),
+                        "timestamp": entry["timestamp"],
+                    }
+
+                elif method == "Network.responseReceived":
+                    req_id = params.get("requestId")
+                    resp = params.get("response", {})
+                    responses[req_id] = {
+                        "status": resp.get("status"),
+                        "mimeType": resp.get("mimeType", ""),
+                        "headers": resp.get("headers", {}),
+                    }
+
+            # Merge requests with their responses
+            traffic = []
+            for req_id, req_data in requests.items():
+                req_data["response"] = responses.get(req_id)
+                traffic.append(req_data)
+
+            return traffic
+        except Exception:
+            return []
+
+    def get_response_body(self, request_id):
+        """Get the response body for a specific request ID."""
+        try:
+            result = self.driver.execute_cdp_cmd(
+                "Network.getResponseBody", {"requestId": request_id}
+            )
+            return result.get("body", "")
+        except Exception:
+            return None
+
+    def get_browser_cookies(self):
+        """Get all browser cookies as a dict (name -> value)."""
+        try:
+            cookies = self.driver.get_cookies()
+            return {c["name"]: c["value"] for c in cookies}
+        except Exception:
+            return {}
 
     def get_network_requests(self, only_xhr=False):
         try:
@@ -251,13 +318,19 @@ class DriverManager:
         options = uc.ChromeOptions()
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--mute-audio")
 
         if self.headless:
             options.add_argument("--headless=new")
+            # Override UA to remove "HeadlessChrome" — Cloudflare rejects it otherwise
+            options.add_argument(
+                "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+            )
 
+        # Enable performance log so get_log("performance") / network requests work
         options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
+        # Match installed Chrome major version to avoid SessionNotCreatedException
         self.driver = uc.Chrome(options=options, version_main=self.chrome_version_main)
 
     def refresh(self):
@@ -398,3 +471,30 @@ class DriverManager:
         """Find a select by id and select the option with the given value."""
         el = self.driver.find_element(By.ID, element_id)
         Select(el).select_by_value(value)
+
+
+def explore_page(url: str, output_dir: str = "debug/web-manager-explorer") -> None:
+    """
+    Open undetected Chrome, enable network logging, navigate to url,
+    then save all network requests and page HTML under output_dir for analysis.
+    """
+    dm = DriverManager(undetected=True)
+    try:
+        dm.enable_network_logging()
+        dm.get(url)
+        time.sleep(3)
+        requests = dm.get_network_requests()
+        html = dm.get_page_source()
+    finally:
+        dm.close()
+
+    os.makedirs(output_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    requests_path = os.path.join(output_dir, f"network_requests_{ts}.json")
+    html_path = os.path.join(output_dir, f"page_{ts}.html")
+    with open(requests_path, "w", encoding="utf-8") as f:
+        json.dump(requests, f, indent=2)
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"Saved {len(requests)} requests to {requests_path}")
+    print(f"Saved HTML to {html_path}")
